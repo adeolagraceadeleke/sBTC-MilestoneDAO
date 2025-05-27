@@ -205,3 +205,111 @@
         (map-get? vote-tallies { proposal-id: proposal-id })
     ))
 )
+
+
+;; Vote on Proposal
+(define-public (vote-on-proposal (proposal-id uint) (in-favor bool))
+    (let
+        (
+            ;; First validate the proposal-id
+            (valid-id (asserts! (validate-proposal-id proposal-id) err-not-found))
+            (proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) err-not-found))
+            (current-tally (default-to 
+                { positive-count: u0, total-count: u0 }
+                (map-get? vote-tallies { proposal-id: proposal-id })))
+        )
+        ;; Validate proposal state
+        (asserts! (is-eq (get status proposal) "pending") err-invalid-state)
+        ;; Check if voter has already voted
+        (asserts! (is-none (map-get? votes { proposal-id: proposal-id, voter: tx-sender })) err-invalid-state)
+
+        ;; Record the vote
+        (map-set votes
+            { proposal-id: proposal-id, voter: tx-sender }
+            { in-favor: in-favor }
+        )
+
+        ;; Update vote tally
+        (map-set vote-tallies
+            { proposal-id: proposal-id }
+            {
+                positive-count: (if in-favor 
+                    (+ (get positive-count current-tally) u1)
+                    (get positive-count current-tally)),
+                total-count: (+ (get total-count current-tally) u1)
+            }
+        )
+        (ok true)
+    )
+)
+
+;; Complete Milestone
+(define-public (complete-milestone (proposal-id uint) (milestone-index uint))
+    (let
+        (
+            ;; First validate the proposal-id
+            (valid-id (asserts! (validate-proposal-id proposal-id) err-not-found))
+            (proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) err-not-found))
+            (pool (unwrap! (map-get? grant-pools { pool-id: (get pool-id proposal) }) err-not-found))
+        )
+        ;; Validate proposal state
+        (asserts! (is-eq (get status proposal) "approved") err-invalid-state)
+        ;; Validate user is the applicant
+        (asserts! (is-eq tx-sender (get applicant proposal)) err-unauthorized)
+        ;; Validate milestone index
+        (asserts! (< milestone-index (len (get milestones proposal))) err-invalid-milestone)
+
+        (ok true)
+    )
+)
+
+;; Approve or Reject Proposal
+(define-public (finalize-proposal (proposal-id uint))
+    (let
+        (
+            ;; First validate the proposal-id
+            (valid-id (asserts! (validate-proposal-id proposal-id) err-not-found))
+            (proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) err-not-found))
+            (pool (unwrap! (map-get? grant-pools { pool-id: (get pool-id proposal) }) err-not-found))
+            (vote-tally (default-to 
+                { positive-count: u0, total-count: u0 }
+                (map-get? vote-tallies { proposal-id: proposal-id })))
+        )
+        ;; Check permissions
+        (asserts! (is-eq tx-sender (get owner pool)) err-owner-only)
+        ;; Check proposal is pending
+        (asserts! (is-eq (get status proposal) "pending") err-invalid-state)
+        ;; Check minimum votes
+        (asserts! (>= (get total-count vote-tally) (var-get minimum-votes-required)) err-insufficient-votes)
+        ;; Check if there are any votes
+        (asserts! (> (get total-count vote-tally) u0) err-no-votes)
+
+        ;; Calculate if proposal is approved (more than quorum threshold)
+        (if (>= (get positive-count vote-tally) 
+            (/ (* (get total-count vote-tally) (var-get quorum-threshold)) u100))
+            ;; Approve proposal
+            (begin
+                (map-set proposals
+                    { proposal-id: proposal-id }
+                    (merge proposal { status: "approved" })
+                )
+                ;; Update pool remaining amount
+                (map-set grant-pools
+                    { pool-id: (get pool-id proposal) }
+                    (merge pool 
+                        { remaining-amount: (- (get remaining-amount pool) (get requested-amount proposal)) }
+                    )
+                )
+                (ok true)
+            )
+            ;; Reject proposal
+            (begin
+                (map-set proposals
+                    { proposal-id: proposal-id }
+                    (merge proposal { status: "rejected" })
+                )
+                (ok true)
+            )
+        )
+    )
+)
